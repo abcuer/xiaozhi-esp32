@@ -160,15 +160,10 @@ public:
         touch_button_(TOUCH_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
-        ESP_LOGI(TAG, "Ctor step: InitializeDisplayI2c");
         InitializeDisplayI2c();
-        ESP_LOGI(TAG, "Ctor step: InitializeSsd1306Display");
         InitializeSsd1306Display();
-        ESP_LOGI(TAG, "Ctor step: InitializeButtons");
         InitializeButtons();
-        ESP_LOGI(TAG, "Ctor step: InitializeTools");
         InitializeTools();
-        ESP_LOGI(TAG, "Ctor step: constructor done");
     }
 
     virtual Led* GetLed() override {
@@ -178,12 +173,11 @@ public:
 
     virtual AudioCodec* GetAudioCodec() override {
 #ifdef AUDIO_I2S_METHOD_SIMPLEX
-        // INMP441 output channel depends on the L/R pin. Using RIGHT here is a
-        // safer fallback for this custom board because the mic L/R pin is not tied.
+        // INMP441 outputs the left channel when L/R is tied to GND.
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT,
             I2S_STD_SLOT_LEFT, AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS,
-            AUDIO_I2S_MIC_GPIO_DIN, I2S_STD_SLOT_RIGHT);
+            AUDIO_I2S_MIC_GPIO_DIN, I2S_STD_SLOT_LEFT);
 #else
         static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);

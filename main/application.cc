@@ -64,18 +64,13 @@ void Application::Initialize() {
 
     // Setup the display
     auto display = board.GetDisplay();
-    ESP_LOGI(TAG, "Init step: display SetupUI");
     display->SetupUI();
     // Print board name/version info
-    ESP_LOGI(TAG, "Init step: display initial system message");
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
     // Setup the audio service
-    ESP_LOGI(TAG, "Init step: get audio codec");
     auto codec = board.GetAudioCodec();
-    ESP_LOGI(TAG, "Init step: initialize audio service");
     audio_service_.Initialize(codec);
-    ESP_LOGI(TAG, "Init step: start audio service");
     audio_service_.Start();
 
     AudioServiceCallbacks callbacks;
@@ -104,7 +99,6 @@ void Application::Initialize() {
     mcp_server.AddUserOnlyTools();
 
     // Set network event callback for UI updates and network state handling
-    ESP_LOGI(TAG, "Init step: set network callback");
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
         auto display = Board::GetInstance().GetDisplay();
         
@@ -162,11 +156,9 @@ void Application::Initialize() {
     });
 
     // Start network asynchronously
-    ESP_LOGI(TAG, "Init step: start network");
     board.StartNetwork();
 
     // Update the status bar immediately to show the network state
-    ESP_LOGI(TAG, "Init step: update status bar");
     display->UpdateStatusBar(true);
 }
 
