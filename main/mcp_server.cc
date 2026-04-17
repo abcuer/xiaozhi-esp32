@@ -7,7 +7,13 @@
 #include <esp_log.h>
 #include <esp_app_desc.h>
 #include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <esp_pthread.h>
 
 #include "application.h"
@@ -19,6 +25,363 @@
 #include "lvgl_display.h"
 
 #define TAG "MCP"
+
+namespace {
+
+class ScopedThreadConfig {
+public:
+    ScopedThreadConfig(const char* name, size_t stack_size, int priority) {
+        previous_cfg_ = esp_pthread_get_default_config();
+        auto cfg = previous_cfg_;
+        cfg.thread_name = name;
+        cfg.stack_size = stack_size;
+        cfg.prio = priority;
+        esp_pthread_set_cfg(&cfg);
+    }
+
+    ~ScopedThreadConfig() {
+        esp_pthread_set_cfg(&previous_cfg_);
+    }
+
+private:
+    esp_pthread_cfg_t previous_cfg_ = {};
+};
+
+std::string Trim(std::string value) {
+    auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+std::string TrimPunctuation(std::string value) {
+    static const char* kPrefixes[] = {"，", "。", "！", "？", ",", ".", "!", "?", "：", ":"};
+    static const char* kSuffixes[] = {"，", "。", "！", "？", ",", ".", "!", "?", "：", ":"};
+    bool changed = true;
+    while (changed && !value.empty()) {
+        changed = false;
+        for (auto* prefix : kPrefixes) {
+            const auto len = std::strlen(prefix);
+            if (value.size() >= len && value.compare(0, len, prefix) == 0) {
+                value.erase(0, len);
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            continue;
+        }
+        for (auto* suffix : kSuffixes) {
+            const auto len = std::strlen(suffix);
+            if (value.size() >= len && value.compare(value.size() - len, len, suffix) == 0) {
+                value.resize(value.size() - len);
+                changed = true;
+                break;
+            }
+        }
+    }
+    return Trim(value);
+}
+
+std::string ExtractSongKeyword(const std::string& input) {
+    auto keyword = Trim(input);
+    auto left = keyword.find("《");
+    auto right = keyword.find("》");
+    if (left != std::string::npos && right != std::string::npos && right > left) {
+        keyword = keyword.substr(left + strlen("《"), right - left - strlen("《"));
+    }
+
+    keyword = TrimPunctuation(keyword);
+
+    static const char* kLeadingPhrases[] = {
+        "播放歌曲", "播放一下", "播放一首", "播放", "放歌曲", "放一下", "放一首", "放首", "放",
+        "来一首", "来首", "点一首", "我想听", "想听", "帮我放", "帮我播", "能放", "可以放"
+    };
+    for (auto* phrase : kLeadingPhrases) {
+        const auto len = std::strlen(phrase);
+        if (keyword.size() >= len && keyword.compare(0, len, phrase) == 0) {
+            keyword.erase(0, len);
+            break;
+        }
+    }
+
+    keyword = TrimPunctuation(keyword);
+
+    static const char* kTrailingParticles[] = {"啊", "呀", "呢", "哦", "嘛", "呗", "啦", "哇", "诶", "欸", "嗯"};
+    for (auto* particle : kTrailingParticles) {
+        const auto len = std::strlen(particle);
+        if (keyword.size() > len && keyword.compare(keyword.size() - len, len, particle) == 0) {
+            keyword.resize(keyword.size() - len);
+            break;
+        }
+    }
+
+    return TrimPunctuation(keyword);
+}
+
+std::string UrlEncode(const std::string& input) {
+    std::string encoded;
+    encoded.reserve(input.size() * 3);
+    for (unsigned char ch : input) {
+        if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            encoded.push_back(static_cast<char>(ch));
+            continue;
+        }
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%%%02X", ch);
+        encoded.append(buf);
+    }
+    return encoded;
+}
+
+std::string ToLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+cJSON* CreateMusicResult(bool success, const char* message) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "success", success);
+    cJSON_AddStringToObject(root, "message", message);
+    return root;
+}
+
+struct MusicSearchResult {
+    bool success = false;
+    bool request_failed = false;
+    bool timed_out = false;
+    std::string message;
+    std::string title;
+    std::string artist;
+    std::string url;
+    std::string cover;
+    int quality = 0;
+    int last_error = 0;
+};
+
+struct MusicProbeResult {
+    bool reachable = false;
+    std::string url;
+    std::string content_type;
+    int status_code = -1;
+};
+
+MusicSearchResult QueryTencentMusic(const std::string& keyword, int quality) {
+    MusicSearchResult result;
+    result.quality = quality;
+    auto search_url = "https://api.vkeys.cn/v2/music/tencent?word=" + UrlEncode(keyword) +
+                      "&choose=1&quality=" + std::to_string(quality);
+    static constexpr int kMusicQueryTimeoutMs = 2500;
+    static constexpr int kMaxQueryAttempts = 2;
+
+    for (int attempt = 1; attempt <= kMaxQueryAttempts; ++attempt) {
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+        if (!http) {
+            result.request_failed = true;
+            result.message = "点歌接口请求失败";
+        } else {
+            http->SetTimeout(kMusicQueryTimeoutMs);
+            if (!http->Open("GET", search_url)) {
+                result.request_failed = true;
+                result.last_error = http->GetLastError();
+                result.timed_out = result.last_error == 0x8006;
+                result.message = result.timed_out ? "点歌接口连接超时" : "点歌接口请求失败";
+                ESP_LOGW(TAG, "Music query open failed: keyword=%s quality=%d attempt=%d err=0x%x",
+                         keyword.c_str(), quality, attempt, result.last_error);
+                http->Close();
+            } else {
+                auto status_code = http->GetStatusCode();
+                auto response = http->ReadAll();
+                http->Close();
+
+                if (status_code != 200 || response.empty()) {
+                    result.request_failed = true;
+                    result.message = "点歌接口请求失败";
+                    result.last_error = http->GetLastError();
+                    result.timed_out = result.last_error == 0x8006;
+                    ESP_LOGW(TAG, "Music query failed: keyword=%s quality=%d attempt=%d status=%d",
+                             keyword.c_str(), quality, attempt, status_code);
+                } else {
+                    cJSON* root = cJSON_Parse(response.c_str());
+                    if (!root) {
+                        result.request_failed = true;
+                        result.message = "点歌接口响应异常";
+                        ESP_LOGW(TAG, "Music query returned invalid JSON: keyword=%s quality=%d attempt=%d",
+                                 keyword.c_str(), quality, attempt);
+                    } else {
+                        auto code = cJSON_GetObjectItem(root, "code");
+                        auto data = cJSON_GetObjectItem(root, "data");
+                        auto song = data ? cJSON_GetObjectItem(data, "song") : nullptr;
+                        auto singer = data ? cJSON_GetObjectItem(data, "singer") : nullptr;
+                        auto url = data ? cJSON_GetObjectItem(data, "url") : nullptr;
+                        auto cover = data ? cJSON_GetObjectItem(data, "cover") : nullptr;
+
+                        if (!cJSON_IsNumber(code) || code->valueint != 200 || !cJSON_IsObject(data) ||
+                            !cJSON_IsString(url) || url->valuestring[0] == '\0') {
+                            cJSON_Delete(root);
+                            result.request_failed = false;
+                            result.message = "未找到可播放歌曲";
+                            return result;
+                        }
+
+                        result.success = true;
+                        result.request_failed = false;
+                        result.title = cJSON_IsString(song) ? song->valuestring : keyword;
+                        result.artist = cJSON_IsString(singer) ? singer->valuestring : "";
+                        result.url = url->valuestring;
+                        result.cover = cJSON_IsString(cover) ? cover->valuestring : "";
+                        cJSON_Delete(root);
+                        return result;
+                    }
+                }
+            }
+        }
+
+        if (attempt < kMaxQueryAttempts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+    }
+
+    return result;
+}
+
+bool IsSupportedMusicContentType(const std::string& content_type) {
+    auto lower_type = ToLower(content_type);
+    return lower_type.find("audio/mpeg") != std::string::npos ||
+           lower_type.find("audio/mp3") != std::string::npos ||
+           lower_type.find("audio/mp4") != std::string::npos ||
+           lower_type.find("audio/x-m4a") != std::string::npos;
+}
+
+MusicProbeResult ProbeMusicStream(const std::string& initial_url) {
+    MusicProbeResult result;
+    if (initial_url.empty()) {
+        return result;
+    }
+
+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+    if (!http) {
+        return result;
+    }
+
+    http->SetTimeout(4000);
+    std::string stream_url = initial_url;
+    int redirect_count = 0;
+    while (redirect_count <= 2) {
+        if (!http->Open("HEAD", stream_url)) {
+            http->Close();
+            return result;
+        }
+
+        auto status_code = http->GetStatusCode();
+        if (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308) {
+            auto location = http->GetResponseHeader("Location");
+            http->Close();
+            if (location.empty()) {
+                return result;
+            }
+            stream_url = location;
+            ++redirect_count;
+            continue;
+        }
+
+        auto content_type = http->GetResponseHeader("Content-Type");
+        http->Close();
+
+        result.status_code = status_code;
+        result.url = stream_url;
+        result.content_type = content_type;
+        result.reachable = (status_code == 200 || status_code == 206) &&
+                           IsSupportedMusicContentType(content_type);
+        return result;
+    }
+
+    return result;
+}
+
+std::optional<MusicSearchResult> FindPlayableMusicResult(const std::string& keyword) {
+    // quality=6 frequently returns stale 404 links from the upstream API,
+    // so prefer the more stable qualities first and only try 6 later.
+    static const int kCandidateQualities[] = {1, 2, 3, 4, 5, 6};
+
+    std::vector<std::string> checked_urls;
+    checked_urls.reserve(sizeof(kCandidateQualities) / sizeof(kCandidateQualities[0]));
+    bool had_query_failure = false;
+    bool had_unplayable_candidate = false;
+
+    for (int quality : kCandidateQualities) {
+        auto candidate = QueryTencentMusic(keyword, quality);
+        if (!candidate.success || candidate.url.empty()) {
+            if (candidate.request_failed) {
+                had_query_failure = true;
+                ESP_LOGW(TAG, "Music query skipped: keyword=%s quality=%d reason=%s",
+                         keyword.c_str(), quality, candidate.message.c_str());
+                if (candidate.timed_out) {
+                    ESP_LOGW(TAG, "Abort remaining music qualities because upstream query timed out: keyword=%s quality=%d",
+                             keyword.c_str(), quality);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (std::find(checked_urls.begin(), checked_urls.end(), candidate.url) != checked_urls.end()) {
+            continue;
+        }
+        checked_urls.push_back(candidate.url);
+
+        auto probe = ProbeMusicStream(candidate.url);
+        if (probe.reachable) {
+            candidate.url = probe.url;
+            return candidate;
+        }
+
+        had_unplayable_candidate = true;
+        ESP_LOGW(TAG, "Music candidate rejected: keyword=%s quality=%d status=%d type=%s url=%s",
+                 keyword.c_str(), quality, probe.status_code, probe.content_type.c_str(), candidate.url.c_str());
+    }
+
+    if (had_query_failure && !had_unplayable_candidate) {
+        ESP_LOGW(TAG, "Music search exhausted because upstream queries kept failing: keyword=%s", keyword.c_str());
+    }
+
+    return std::nullopt;
+}
+
+template <typename T>
+std::optional<T> RunOnMainThreadAndWait(Application& app,
+                                        std::chrono::milliseconds timeout,
+                                        std::function<T()> task) {
+    struct SharedState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        std::optional<T> result;
+    };
+
+    auto state = std::make_shared<SharedState>();
+    app.Schedule([state, task = std::move(task)]() mutable {
+        T local_result = task();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->result = std::move(local_result);
+            state->done = true;
+        }
+        state->cv.notify_one();
+    });
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->cv.wait_for(lock, timeout, [state]() {
+        return state->done;
+    })) {
+        return std::nullopt;
+    }
+    return state->result;
+}
+
+}  // namespace
 
 McpServer::McpServer() {
 }
@@ -119,7 +482,77 @@ void McpServer::AddCommonTools() {
                 return camera->Explain(question);
             });
     }
+
 #endif
+
+    auto music_search_tool = new McpTool("self.music.search_and_play",
+        "搜索并播放一首歌曲。用户让你播放音乐、点歌、播放某首歌时，使用这个工具。参数 keyword 只传歌曲关键词，不要带多余解释。",
+        PropertyList({
+            Property("keyword", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto keyword = ExtractSongKeyword(properties["keyword"].value<std::string>());
+            if (keyword.empty()) {
+                return CreateMusicResult(false, "未提供有效歌曲关键词");
+            }
+
+            auto search_result = FindPlayableMusicResult(keyword);
+            if (!search_result.has_value()) {
+                return CreateMusicResult(false, "未找到可播放歌曲");
+            }
+
+            std::string title = search_result->title;
+            std::string artist = search_result->artist;
+            std::string play_url = search_result->url;
+
+            auto& app = Application::GetInstance();
+            auto started = RunOnMainThreadAndWait<bool>(app,
+                                                        std::chrono::milliseconds(15000),
+                                                        [&app, &play_url, &title, &artist]() {
+                                                            return app.StartMusicPlayback(play_url, title, artist);
+                                                        });
+            if (!started.has_value()) {
+                return CreateMusicResult(false, "设备忙，请稍后重试");
+            }
+
+            if (!started.value()) {
+                return CreateMusicResult(false, "歌曲链接不可播放或格式暂不支持");
+            }
+
+            cJSON* result = cJSON_CreateObject();
+            cJSON_AddBoolToObject(result, "success", true);
+            cJSON_AddStringToObject(result, "message", "开始播放音乐");
+            cJSON_AddStringToObject(result, "keyword", keyword.c_str());
+            cJSON_AddStringToObject(result, "title", title.c_str());
+            cJSON_AddStringToObject(result, "artist", artist.c_str());
+            cJSON_AddStringToObject(result, "url", play_url.c_str());
+            cJSON_AddNumberToObject(result, "quality", search_result->quality);
+            if (!search_result->cover.empty()) {
+                cJSON_AddStringToObject(result, "cover", search_result->cover.c_str());
+            }
+            return result;
+        });
+    music_search_tool->set_requires_main_thread(false);
+    AddTool(music_search_tool);
+
+    AddTool("self.music.stop",
+        "停止当前正在播放的网络音乐。用户说停止播放、停止音乐、别放了时，使用这个工具。",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            if (!app.GetMusicPlayer().IsPlaying()) {
+                return CreateMusicResult(true, "当前没有正在播放的音乐");
+            }
+            app.StopMusicPlayback(true, "音乐已停止");
+            return CreateMusicResult(true, "音乐已停止");
+        });
+
+    AddTool("self.music.get_status",
+        "获取当前音乐播放状态，包括是否正在播放、歌曲名、歌手、URL 和错误信息。",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            return Application::GetInstance().GetMusicPlayer().GetStatusJson();
+        });
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());
@@ -298,6 +731,22 @@ void McpServer::AddUserOnlyTools() {
                 return true;
             });
     }
+
+    AddUserOnlyTool("self.music.play_url", "Play a music URL directly for debugging.",
+        PropertyList({
+            Property("url", kPropertyTypeString),
+            Property("title", kPropertyTypeString, std::string("调试播放")),
+            Property("artist", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            if (!app.StartMusicPlayback(properties["url"].value<std::string>(),
+                                        properties["title"].value<std::string>(),
+                                        properties["artist"].value<std::string>())) {
+                return CreateMusicResult(false, "歌曲链接不可播放或格式暂不支持");
+            }
+            return CreateMusicResult(true, "开始播放调试音乐");
+        });
 }
 
 void McpServer::AddTool(McpTool* tool) {
@@ -547,6 +996,22 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
     } catch (const std::exception& e) {
         ESP_LOGE(TAG, "tools/call: %s", e.what());
         ReplyError(id, e.what());
+        return;
+    }
+
+    if (!(*tool_iter)->requires_main_thread()) {
+        auto* tool = *tool_iter;
+        {
+            ScopedThreadConfig thread_cfg("mcp_tool", 20480, 4);
+            std::thread([this, id, tool, arguments = std::move(arguments)]() mutable {
+                try {
+                    ReplyResult(id, tool->Call(arguments));
+                } catch (const std::exception& e) {
+                    ESP_LOGE(TAG, "tools/call async: %s", e.what());
+                    ReplyError(id, e.what());
+                }
+            }).detach();
+        }
         return;
     }
 

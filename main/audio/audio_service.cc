@@ -686,6 +686,9 @@ void AudioService::CheckAndUpdateAudioPowerState() {
     if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
         codec_->EnableInput(false);
     }
+    if (external_playback_active_.load()) {
+        return;
+    }
     if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
         // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.
         if (!(codec_->duplex() && codec_->input_enabled())) {
@@ -731,4 +734,16 @@ bool AudioService::IsAfeWakeWord() {
 #else
     return false;
 #endif
+}
+
+void AudioService::SetExternalPlaybackActive(bool active) {
+    auto previous = external_playback_active_.exchange(active);
+    if (previous == active) {
+        return;
+    }
+    if (active && !codec_->output_enabled()) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        codec_->EnableOutput(true);
+    }
 }

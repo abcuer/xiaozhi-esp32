@@ -212,6 +212,7 @@ private:
     PropertyList properties_;
     std::function<ReturnValue(const PropertyList&)> callback_;
     bool user_only_ = false;
+    bool requires_main_thread_ = true;
 
 public:
     McpTool(const std::string& name, 
@@ -224,10 +225,12 @@ public:
         callback_(callback) {}
 
     void set_user_only(bool user_only) { user_only_ = user_only; }
+    void set_requires_main_thread(bool requires_main_thread) { requires_main_thread_ = requires_main_thread; }
     inline const std::string& name() const { return name_; }
     inline const std::string& description() const { return description_; }
     inline const PropertyList& properties() const { return properties_; }
     inline bool user_only() const { return user_only_; }
+    inline bool requires_main_thread() const { return requires_main_thread_; }
 
     std::string to_json() const {
         std::vector<std::string> required = properties_.GetRequired();

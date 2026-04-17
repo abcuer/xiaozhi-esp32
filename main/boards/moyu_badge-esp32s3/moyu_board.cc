@@ -109,11 +109,8 @@ private:
             }
             app.ToggleChatState();
         });
-        touch_button_.OnPressDown([this]() {
-            Application::GetInstance().StartListening();
-        });
-        touch_button_.OnPressUp([this]() {
-            Application::GetInstance().StopListening();
+        touch_button_.OnClick([this]() {
+            Application::GetInstance().ToggleChatState();
         });
 
         volume_up_button_.OnClick([this]() {

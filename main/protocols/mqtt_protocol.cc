@@ -115,10 +115,16 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s", session_id ? session_id->valuestring : "null");
-            if (session_id == nullptr || session_id_ == session_id->valuestring) {
+            std::string goodbye_session_id = cJSON_IsString(session_id) ? session_id->valuestring : "";
+            if (session_id == nullptr || session_id_ == goodbye_session_id) {
                 auto alive = alive_;  // Capture alive flag
-                Application::GetInstance().Schedule([this, alive]() {
+                Application::GetInstance().Schedule([this, alive, goodbye_session_id]() {
                     if (*alive) {
+                        if (!goodbye_session_id.empty() && session_id_ != goodbye_session_id) {
+                            ESP_LOGI(TAG, "Ignore stale goodbye for session_id: %s, current session_id: %s",
+                                     goodbye_session_id.c_str(), session_id_.c_str());
+                            return;
+                        }
                         // Server initiated goodbye, don't send goodbye back to avoid ping-pong
                         CloseAudioChannel(false);
                     }

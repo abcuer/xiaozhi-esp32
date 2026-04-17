@@ -72,6 +72,7 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
+    music_player_.Initialize(codec);
 
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
@@ -84,6 +85,39 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     audio_service_.SetCallbacks(callbacks);
+
+    MusicPlayer::Callbacks music_callbacks;
+    music_callbacks.on_playback_started = [this](const std::string& title, const std::string& artist) {
+        Schedule([this, title, artist]() {
+            auto display = Board::GetInstance().GetDisplay();
+            std::string playing_title = title.empty() ? "正在播放" : title;
+            if (!artist.empty()) {
+                playing_title += " - ";
+                playing_title += artist;
+            }
+            display->SetStatus("正在播放");
+            display->SetChatMessage("system", playing_title.c_str());
+            display->ShowNotification(("正在播放：" + playing_title).c_str(), 3000);
+
+            if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                ESP_LOGI(TAG, "Closing audio channel for music playback while keeping WiFi in performance mode");
+                protocol_->CloseAudioChannel();
+            }
+
+            UpdatePowerSaveLevelForAudioActivity();
+        });
+    };
+    music_callbacks.on_playback_stopped = [this](const std::string& reason) {
+        Schedule([this, reason]() {
+            FinishMusicPlayback(true, reason);
+        });
+    };
+    music_callbacks.on_playback_error = [this](const std::string& reason) {
+        Schedule([this, reason]() {
+            FinishMusicPlayback(true, reason);
+        });
+    };
+    music_player_.SetCallbacks(std::move(music_callbacks));
 
     // Add state change listeners
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
@@ -284,6 +318,10 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    if (music_player_.IsPlaying()) {
+        StopMusicPlayback(true, "网络已断开，已停止播放");
+    }
+
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
@@ -509,9 +547,15 @@ void Application::InitializeProtocol() {
         }
     });
     
-    protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    protocol_->OnAudioChannelClosed([this]() {
+        UpdatePowerSaveLevelForAudioActivity();
+        if (music_player_.IsPlaying() || audio_service_.IsExternalPlaybackActive()) {
+            ESP_LOGI(TAG, "Keep WiFi in performance mode because music playback is still active");
+        }
         Schedule([this]() {
+            if (music_player_.IsPlaying()) {
+                return;
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -524,6 +568,9 @@ void Application::InitializeProtocol() {
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
+                if (music_player_.IsPlaying()) {
+                    StopMusicPlayback(false);
+                }
                 Schedule([this]() {
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
@@ -673,6 +720,10 @@ void Application::StopListening() {
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
+
+    if (music_player_.IsPlaying()) {
+        StopMusicPlayback(false);
+    }
     
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -727,6 +778,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
 void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
+
+    if (music_player_.IsPlaying()) {
+        StopMusicPlayback(false);
+    }
     
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -775,6 +830,26 @@ void Application::HandleStopListeningEvent() {
 
 void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
+        return;
+    }
+
+    if (music_player_.IsPlaying()) {
+        ESP_LOGI(TAG, "Wake word detected during music playback, interrupting music and switching to manual listening");
+        StopMusicPlayback(false);
+
+        // Always reopen a fresh audio channel after interrupting music.
+        // Reusing an existing channel here can leave the UI in listening state
+        // while the server side has already closed or half-closed the session.
+        play_popup_on_listening_ = true;
+        if (protocol_->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "Closing stale audio channel before reopening manual listening after music interruption");
+            protocol_->CloseAudioChannel(false);
+        }
+        ESP_LOGI(TAG, "Reopening audio channel for manual listening after music interruption");
+        SetDeviceState(kDeviceStateConnecting);
+        Schedule([this]() {
+            ContinueOpenAudioChannel(kListeningModeManualStop);
+        });
         return;
     }
 
@@ -951,8 +1026,84 @@ ListeningMode Application::GetDefaultListeningMode() const {
     return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
 }
 
+bool Application::StartMusicPlayback(const std::string& url, const std::string& title, const std::string& artist) {
+    music_player_.Stop();
+    PrepareForMusicPlayback(title, artist);
+
+    auto started = music_player_.PlayFromUrl(url, title, artist);
+    if (!started) {
+        FinishMusicPlayback(true, "");
+    }
+    return started;
+}
+
+void Application::StopMusicPlayback(bool restore_idle, const std::string& reason) {
+    music_player_.Stop();
+    FinishMusicPlayback(restore_idle, reason);
+}
+
+void Application::PrepareForMusicPlayback(const std::string& title, const std::string& artist) {
+    if (GetDeviceState() == kDeviceStateSpeaking) {
+        AbortSpeaking(kAbortReasonNone);
+    } else if (GetDeviceState() == kDeviceStateListening && protocol_) {
+        protocol_->SendStopListening();
+    }
+
+    audio_service_.ResetDecoder();
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(true);
+    audio_service_.SetExternalPlaybackActive(true);
+    UpdatePowerSaveLevelForAudioActivity();
+    SetDeviceState(kDeviceStateIdle);
+
+    auto display = Board::GetInstance().GetDisplay();
+    std::string notification = "正在获取歌曲链接";
+    if (!title.empty()) {
+        notification += "：";
+        notification += title;
+        if (!artist.empty()) {
+            notification += " - ";
+            notification += artist;
+        }
+    }
+    display->SetStatus("正在加载");
+    display->SetChatMessage("system", notification.c_str());
+    display->ShowNotification(notification, 3000);
+}
+
+void Application::UpdatePowerSaveLevelForAudioActivity() {
+    auto& board = Board::GetInstance();
+    bool keep_performance =
+        music_player_.IsPlaying() ||
+        audio_service_.IsExternalPlaybackActive() ||
+        (protocol_ && protocol_->IsAudioChannelOpened());
+    board.SetPowerSaveLevel(keep_performance ? PowerSaveLevel::PERFORMANCE : PowerSaveLevel::LOW_POWER);
+}
+
+void Application::FinishMusicPlayback(bool restore_idle, const std::string& reason) {
+    audio_service_.SetExternalPlaybackActive(false);
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(true);
+    UpdatePowerSaveLevelForAudioActivity();
+
+    auto display = Board::GetInstance().GetDisplay();
+    if (restore_idle) {
+        SetDeviceState(kDeviceStateIdle);
+        display->SetStatus(Lang::Strings::STANDBY);
+        display->ClearChatMessages();
+        display->SetEmotion("neutral");
+    }
+
+    if (!reason.empty()) {
+        display->ShowNotification(reason);
+    }
+}
+
 void Application::Reboot() {
     ESP_LOGI(TAG, "Rebooting...");
+    if (music_player_.IsPlaying()) {
+        music_player_.Stop();
+    }
     // Disconnect the audio channel
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         protocol_->CloseAudioChannel();
@@ -972,6 +1123,9 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     std::string version_info = version.empty() ? "(Manual upgrade)" : version;
 
     // Close audio channel if it's open
+    if (music_player_.IsPlaying()) {
+        music_player_.Stop();
+    }
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         ESP_LOGI(TAG, "Closing audio channel before firmware upgrade");
         protocol_->CloseAudioChannel();
@@ -1050,6 +1204,10 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
+    if (music_player_.IsPlaying()) {
+        return false;
+    }
+
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
     }
@@ -1108,6 +1266,10 @@ void Application::PlaySound(const std::string_view& sound) {
 
 void Application::ResetProtocol() {
     Schedule([this]() {
+        if (music_player_.IsPlaying()) {
+            music_player_.Stop();
+            FinishMusicPlayback(true, "");
+        }
         // Close audio channel if opened
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();

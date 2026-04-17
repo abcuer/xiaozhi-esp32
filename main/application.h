@@ -14,6 +14,7 @@
 #include "protocol.h"
 #include "ota.h"
 #include "audio_service.h"
+#include "music_player.h"
 #include "device_state.h"
 #include "device_state_machine.h"
 
@@ -112,6 +113,9 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    MusicPlayer& GetMusicPlayer() { return music_player_; }
+    bool StartMusicPlayback(const std::string& url, const std::string& title, const std::string& artist);
+    void StopMusicPlayback(bool restore_idle = true, const std::string& reason = "");
     
     /**
      * Reset protocol resources (thread-safe)
@@ -134,6 +138,7 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     AudioService audio_service_;
+    MusicPlayer music_player_;
     std::unique_ptr<Ota> ota_;
 
     bool has_server_time_ = false;
@@ -166,6 +171,9 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
+    void PrepareForMusicPlayback(const std::string& title, const std::string& artist);
+    void FinishMusicPlayback(bool restore_idle, const std::string& reason);
+    void UpdatePowerSaveLevelForAudioActivity();
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
