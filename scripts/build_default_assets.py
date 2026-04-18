@@ -20,6 +20,24 @@ import struct
 from datetime import datetime
 
 
+def read_sdkconfig_lines(sdkconfig_path):
+    """
+    Read sdkconfig robustly across platforms.
+    Prefer UTF-8 because sdkconfig may contain user-provided Chinese strings,
+    and fall back to common Windows encodings for older local files.
+    """
+    encodings = ("utf-8", "utf-8-sig", "gbk")
+    last_error = None
+    for encoding in encodings:
+        try:
+            with io.open(sdkconfig_path, "r", encoding=encoding) as f:
+                return f.readlines()
+        except UnicodeDecodeError as e:
+            last_error = e
+
+    raise last_error
+
+
 # =============================================================================
 # Pack model functions (from pack_model.py)
 # =============================================================================
@@ -463,18 +481,17 @@ def read_wakenet_from_sdkconfig(sdkconfig_path):
         return []
         
     models = []
-    with io.open(sdkconfig_path, "r") as f:
-        for label in f:
-            label = label.strip("\n")
-            if 'CONFIG_SR_WN' in label and '#' not in label[0]:
-                if '_NONE' in label:
-                    continue
-                if '=' in label:
-                    label = label.split("=")[0]
-                if '_MULTI' in label:
-                    label = label[:-6]
-                model_name = label.split("_SR_WN_")[-1].lower()
-                models.append(model_name)
+    for label in read_sdkconfig_lines(sdkconfig_path):
+        label = label.strip("\n")
+        if 'CONFIG_SR_WN' in label and '#' not in label[0]:
+            if '_NONE' in label:
+                continue
+            if '=' in label:
+                label = label.split("=")[0]
+            if '_MULTI' in label:
+                label = label[:-6]
+            model_name = label.split("_SR_WN_")[-1].lower()
+            models.append(model_name)
 
     return models
 
@@ -488,12 +505,11 @@ def read_multinet_from_sdkconfig(sdkconfig_path):
         print(f"Warning: sdkconfig file not found: {sdkconfig_path}")
         return []
         
-    with io.open(sdkconfig_path, "r") as f:
-        models_string = ''
-        for label in f:
-            label = label.strip("\n")
-            if 'CONFIG_SR_MN' in label and label[0] != '#':
-                models_string += label
+    models_string = ''
+    for label in read_sdkconfig_lines(sdkconfig_path):
+        label = label.strip("\n")
+        if 'CONFIG_SR_MN' in label and label[0] != '#':
+            models_string += label
 
     models = []
     if "CONFIG_SR_MN_CN_MULTINET3_SINGLE_RECOGNITION" in models_string:
@@ -549,21 +565,20 @@ def read_wake_word_type_from_sdkconfig(sdkconfig_path):
         'wake_word_disabled': False
     }
     
-    with io.open(sdkconfig_path, "r") as f:
-        for line in f:
-            line = line.strip("\n")
-            if line.startswith('#'):
-                continue
-                
-            # Check for wake word type configuration
-            if 'CONFIG_USE_ESP_WAKE_WORD=y' in line:
-                config_values['use_esp_wake_word'] = True
-            elif 'CONFIG_USE_AFE_WAKE_WORD=y' in line:
-                config_values['use_afe_wake_word'] = True
-            elif 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
-                config_values['use_custom_wake_word'] = True
-            elif 'CONFIG_WAKE_WORD_DISABLED=y' in line:
-                config_values['wake_word_disabled'] = True
+    for line in read_sdkconfig_lines(sdkconfig_path):
+        line = line.strip("\n")
+        if line.startswith('#'):
+            continue
+            
+        # Check for wake word type configuration
+        if 'CONFIG_USE_ESP_WAKE_WORD=y' in line:
+            config_values['use_esp_wake_word'] = True
+        elif 'CONFIG_USE_AFE_WAKE_WORD=y' in line:
+            config_values['use_afe_wake_word'] = True
+        elif 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
+            config_values['use_custom_wake_word'] = True
+        elif 'CONFIG_WAKE_WORD_DISABLED=y' in line:
+            config_values['wake_word_disabled'] = True
     
     return config_values
 
@@ -578,34 +593,33 @@ def read_custom_wake_word_from_sdkconfig(sdkconfig_path):
         return None
         
     config_values = {}
-    with io.open(sdkconfig_path, "r") as f:
-        for line in f:
-            line = line.strip("\n")
-            if line.startswith('#') or '=' not in line:
-                continue
-                
-            # Check for custom wake word configuration
-            if 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
-                config_values['use_custom_wake_word'] = True
-            elif 'CONFIG_CUSTOM_WAKE_WORD=' in line and not line.startswith('#'):
-                # Extract string value (remove quotes)
-                value = line.split('=', 1)[1].strip('"')
-                config_values['wake_word'] = value
-            elif 'CONFIG_CUSTOM_WAKE_WORD_DISPLAY=' in line and not line.startswith('#'):
-                # Extract string value (remove quotes)
-                value = line.split('=', 1)[1].strip('"')
-                config_values['display'] = value
-            elif 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=' in line and not line.startswith('#'):
-                # Extract numeric value
-                value = line.split('=', 1)[1]
+    for line in read_sdkconfig_lines(sdkconfig_path):
+        line = line.strip("\n")
+        if line.startswith('#') or '=' not in line:
+            continue
+            
+        # Check for custom wake word configuration
+        if 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
+            config_values['use_custom_wake_word'] = True
+        elif 'CONFIG_CUSTOM_WAKE_WORD=' in line and not line.startswith('#'):
+            # Extract string value (remove quotes)
+            value = line.split('=', 1)[1].strip('"')
+            config_values['wake_word'] = value
+        elif 'CONFIG_CUSTOM_WAKE_WORD_DISPLAY=' in line and not line.startswith('#'):
+            # Extract string value (remove quotes)
+            value = line.split('=', 1)[1].strip('"')
+            config_values['display'] = value
+        elif 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=' in line and not line.startswith('#'):
+            # Extract numeric value
+            value = line.split('=', 1)[1]
+            try:
+                config_values['threshold'] = int(value)
+            except ValueError:
                 try:
-                    config_values['threshold'] = int(value)
+                    config_values['threshold'] = float(value)
                 except ValueError:
-                    try:
-                        config_values['threshold'] = float(value)
-                    except ValueError:
-                        print(f"Warning: Invalid threshold value: {value}")
-                        config_values['threshold'] = 20  # default (will be converted to 0.2)
+                    print(f"Warning: Invalid threshold value: {value}")
+                    config_values['threshold'] = 20  # default (will be converted to 0.2)
     
     # Return config only if custom wake word is enabled and required fields are present
     if (config_values.get('use_custom_wake_word', False) and 

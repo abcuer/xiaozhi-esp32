@@ -834,7 +834,7 @@ void Application::HandleWakeWordDetectedEvent() {
     }
 
     if (music_player_.IsPlaying()) {
-        ESP_LOGI(TAG, "Wake word detected during music playback, interrupting music and switching to manual listening");
+        ESP_LOGI(TAG, "Wake word detected during music playback, interrupting music and switching to wake-word listening");
         StopMusicPlayback(false);
 
         // Always reopen a fresh audio channel after interrupting music.
@@ -845,10 +845,11 @@ void Application::HandleWakeWordDetectedEvent() {
             ESP_LOGI(TAG, "Closing stale audio channel before reopening manual listening after music interruption");
             protocol_->CloseAudioChannel(false);
         }
-        ESP_LOGI(TAG, "Reopening audio channel for manual listening after music interruption");
+        ESP_LOGI(TAG, "Reopening audio channel for wake-word listening after music interruption");
+        auto mode = GetDefaultListeningMode();
         SetDeviceState(kDeviceStateConnecting);
-        Schedule([this]() {
-            ContinueOpenAudioChannel(kListeningModeManualStop);
+        Schedule([this, mode]() {
+            ContinueOpenAudioChannel(mode);
         });
         return;
     }
