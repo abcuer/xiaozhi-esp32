@@ -6,6 +6,7 @@
 #include "mcp_server.h"
 #include <esp_log.h>
 #include <esp_app_desc.h>
+#include <esp_heap_caps.h>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -36,6 +37,7 @@ public:
         cfg.thread_name = name;
         cfg.stack_size = stack_size;
         cfg.prio = priority;
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
         esp_pthread_set_cfg(&cfg);
     }
 
@@ -1099,7 +1101,7 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
 
     if (!(*tool_iter)->requires_main_thread()) {
         auto* tool = *tool_iter;
-        {
+        try {
             ScopedThreadConfig thread_cfg("mcp_tool", 20480, 4);
             std::thread([this, id, tool, arguments = std::move(arguments)]() mutable {
                 try {
@@ -1109,6 +1111,15 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
                     ReplyError(id, e.what());
                 }
             }).detach();
+        } catch (const std::exception& e) {
+            const auto free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            const auto min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+            ESP_LOGE(TAG,
+                     "tools/call async: failed to start worker for %s: %s (free sram=%u min=%u)",
+                     tool_name.c_str(), e.what(),
+                     static_cast<unsigned>(free_sram),
+                     static_cast<unsigned>(min_free_sram));
+            ReplyError(id, "设备忙不过来了，请稍后再试一次");
         }
         return;
     }

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_pthread.h>
 
@@ -86,6 +87,7 @@ public:
         cfg.thread_name = name;
         cfg.stack_size = stack_size;
         cfg.prio = priority;
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
         esp_pthread_set_cfg(&cfg);
     }
 
